@@ -12807,5 +12807,39 @@
     ")"
   ],
   "33d18dda74f6d7b3": "Cancel stack auto-merge",
-  "012c67c7f1a99e33": "Auto-merge stack"
+  "012c67c7f1a99e33": "Auto-merge stack",
+  "9b6bef3746b8b006": "Could not continue the session",
+  "c8b78e7d8682b81e": "Choose a session",
+  "399a0a74a792ce8c": "Search sessions...",
+  "7635bef1a86f132a": "Untitled session",
+  "44ac1782f7e61c45": [
+    "or continue a ",
+    {
+      "i": 1,
+      "k": "_gt_value_1",
+      "v": "v"
+    },
+    " session"
+  ],
+  "98bafe711bc5fc17": [
+    "Continue a ",
+    {
+      "i": 1,
+      "k": "_gt_value_1",
+      "v": "v"
+    },
+    " session"
+  ],
+  "79c314fc54f8b66f": "Looking for sessions...",
+  "b95bf7e5ba01c1e1": [
+    "No ",
+    {
+      "i": 1,
+      "k": "_gt_value_1",
+      "v": "v"
+    },
+    " sessions found for this project."
+  ],
+  "78a87dc17c06455f": "Opened",
+  "be436213a44a2a56": "Showing the most recent sessions."
 }

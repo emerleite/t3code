@@ -12798,5 +12798,39 @@
     ")"
   ],
   "33d18dda74f6d7b3": "Auto-Merge für Stack abbrechen",
-  "012c67c7f1a99e33": "Auto-Merge für Stack"
+  "012c67c7f1a99e33": "Auto-Merge für Stack",
+  "9b6bef3746b8b006": "Die Sitzung konnte nicht fortgesetzt werden",
+  "c8b78e7d8682b81e": "Sitzung auswählen",
+  "399a0a74a792ce8c": "Sitzungen durchsuchen...",
+  "7635bef1a86f132a": "Unbenannte Sitzung",
+  "44ac1782f7e61c45": [
+    "oder eine ",
+    {
+      "i": 1,
+      "k": "_gt_value_1",
+      "v": "v"
+    },
+    "-Sitzung fortsetzen"
+  ],
+  "98bafe711bc5fc17": [
+    "Eine ",
+    {
+      "i": 1,
+      "k": "_gt_value_1",
+      "v": "v"
+    },
+    "-Sitzung fortsetzen"
+  ],
+  "79c314fc54f8b66f": "Sitzungen werden gesucht...",
+  "b95bf7e5ba01c1e1": [
+    "Für dieses Projekt wurden keine ",
+    {
+      "i": 1,
+      "k": "_gt_value_1",
+      "v": "v"
+    },
+    "-Sitzungen gefunden."
+  ],
+  "78a87dc17c06455f": "Geöffnet",
+  "be436213a44a2a56": "Es werden die neuesten Sitzungen angezeigt."
 }

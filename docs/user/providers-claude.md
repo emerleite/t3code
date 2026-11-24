@@ -48,6 +48,23 @@ Claude Code's verbose mode can stay enabled when you use Claude for text generat
 thread titles, branch names, commit messages, and pull request descriptions. On a remote connection,
 T3 Code uses the Claude configuration on the connected server.
 
+## Continue a terminal session
+
+A conversation you started with `claude` in a terminal can carry on as a thread. Start a
+new thread in the project, select **or continue a Claude Code session** under the
+project name, and pick the session. The list covers sessions started in the project
+folder or one of its worktrees, of any age, for every Claude instance in **Settings >
+Providers**. A session started in a worktree opens in that worktree.
+
+The thread resumes the same Claude session, so Claude keeps its context. The thread
+shows the session's messages, up to the first prompt and the newest 2,000, without tool
+activity or attachments. Picking a session you already opened goes to its thread.
+
+Sessions T3 Code started are not listed; they already have threads. After you continue
+a session here, stop using it in the terminal: messages sent there do not appear in the
+thread. To bring in every recent conversation of a project at once, use the
+[Welcome page](./welcome-page.md).
+
 ## Compact long conversations
 
 Set **Auto-compact after** in the Claude provider settings to an integer between

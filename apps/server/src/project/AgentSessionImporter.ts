@@ -6,6 +6,7 @@ import {
   isRuntimeModeAbove,
   AgentSessionImportProjectChangedError,
   AgentSessionImportProjectNotFoundError,
+  AgentSessionImportSessionUnavailableError,
   AgentSessionScanError,
   AgentSessionSource,
   EventId,
@@ -16,6 +17,11 @@ import {
   TurnItemId,
   type AgentSessionImportInput,
   type AgentSessionImportResult,
+  type AgentSessionImportSessionInput,
+  type AgentSessionImportSessionResult,
+  type AgentSessionListInput,
+  type AgentSessionListResult,
+  type ProviderInstanceId,
   type OrchestrationV2AppThread,
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2DomainEvent,
@@ -31,6 +37,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/sql/SqlClient";
 
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -99,6 +106,13 @@ export function isNativeHistoryPending(input: {
   readonly hasRun: boolean;
 }): boolean {
   return input.historyOrigin !== "v1_import" && !input.hasRun;
+}
+
+function importedThreadId(source: {
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly providerSessionId: string;
+}): ThreadId {
+  return ThreadId.make(`import:${source.providerInstanceId}:${source.providerSessionId}`);
 }
 
 function dateTime(value: string): DateTime.Utc {
@@ -205,19 +219,279 @@ const make = Effect.gen(function* () {
   const threadCommands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
   const settingsService = yield* ServerSettings.ServerSettingsService;
   const ceiling = settingsService.managedPolicy?.limits?.maxRuntimeMode;
-  const importRecentAgentThreads = Effect.fn("importRecentAgentThreadsV2")(function* (
-    input: AgentSessionImportInput,
+  const sql = yield* SqlClient.SqlClient;
+  const importProject = Effect.fn("AgentSessionImporter.importProject")(function* (
+    projectId: ProjectId,
   ) {
-    const project = yield* projects.getById(input.projectId).pipe(
+    return yield* projects.getById(projectId).pipe(
       Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-projects", cause })),
       Effect.flatMap(
         Option.match({
-          onNone: () =>
-            Effect.fail(new AgentSessionImportProjectNotFoundError({ projectId: input.projectId })),
+          onNone: () => Effect.fail(new AgentSessionImportProjectNotFoundError({ projectId })),
           onSome: Effect.succeed,
         }),
       ),
     );
+  });
+  // Imports run in full access, except under a policy ceiling: then in the project's default,
+  // which the policy keeps under it, so imported threads never sit above the ceiling.
+  const importRuntimeMode = Effect.fn("AgentSessionImporter.importRuntimeMode")(function* (
+    project: Effect.Success<ReturnType<typeof importProject>>,
+  ) {
+    if (ceiling === undefined) return DEFAULT_RUNTIME_MODE;
+    return yield* settingsService.getSettings.pipe(
+      Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-settings", cause })),
+      Effect.map((settings) => {
+        const mode = resolveProjectSettings(settings, project.id, project).settings
+          .defaultRuntimeMode;
+        return isRuntimeModeAbove(mode, ceiling) ? ceiling : mode;
+      }),
+    );
+  });
+  // Every thread that holds a Claude session, deleted ones included: none can be imported twice.
+  const claudeSessionOwners = Effect.fn("AgentSessionImporter.claudeSessionOwners")(function* () {
+    const rows = yield* sql<{
+      readonly thread_id: string;
+      readonly provider_instance_id: string;
+      readonly native_id: string | null;
+      readonly deleted_at: string | null;
+    }>`
+      SELECT provider.thread_id, provider.provider_instance_id, thread.deleted_at,
+        json_extract(provider.payload_json, '$.nativeThreadRef.nativeId') AS native_id
+      FROM orchestration_v2_projection_provider_threads AS provider
+      LEFT JOIN orchestration_v2_projection_threads AS thread
+        ON thread.thread_id = provider.thread_id
+      WHERE provider.driver = 'claudeAgent'
+    `.pipe(
+      Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-projects", cause })),
+    );
+    return new Map(
+      rows.flatMap((row) =>
+        row.native_id === null
+          ? []
+          : [
+              [
+                `${row.provider_instance_id}\0${row.native_id}`,
+                { threadId: ThreadId.make(row.thread_id), deleted: row.deleted_at !== null },
+              ] as const,
+            ],
+      ),
+    );
+  });
+
+  /** Writes one scanned session as a thread, unless a thread already holds it. */
+  const importThread = Effect.fn("AgentSessionImporter.importThread")(
+    function* (input: {
+      readonly project: { readonly id: ProjectId; readonly workspaceRoot: string };
+      readonly runtimeMode: OrchestrationV2AppThread["runtimeMode"];
+      readonly outcome: Extract<
+        AgentSessionScanner.AgentSessionRecentThread,
+        { _tag: "Importable" }
+      >;
+    }) {
+      const { outcome, project } = input;
+      const { source, thread } = outcome;
+      const threadId = importedThreadId(source);
+      if (
+        thread.source === "claudeAgent" &&
+        !CLAUDE_SESSION_ID_PATTERN.test(thread.providerSessionId)
+      ) {
+        return yield* new AgentSessionUnresumableSessionError({
+          source: thread.source,
+          providerSessionId: thread.providerSessionId,
+        });
+      }
+      const driver = ProviderDriverKind.make(thread.source);
+      // Pi resumes by session file path; its session UUID only names the thread.
+      const nativeThreadId = thread.source === "pi" ? source.filePath : thread.providerSessionId;
+      const persistRuntime = runtimes.upsert(
+        {
+          threadId,
+          providerName: driver,
+          providerInstanceId: thread.providerInstanceId,
+          adapterKey: driver,
+          runtimeMode: input.runtimeMode,
+          status: "stopped",
+          lastSeenAt: thread.updatedAt,
+          resumeCursor:
+            thread.source === "claudeAgent"
+              ? { threadId, resume: thread.providerSessionId }
+              : { threadId: nativeThreadId },
+          runtimePayload: { cwd: outcome.worktree?.path ?? project.workspaceRoot },
+        },
+        { onConflict: "ignore" },
+      );
+      const existing = yield* Effect.option(orchestrator.getThreadRecords(threadId, ["messages"]));
+      if (Option.isSome(existing)) {
+        if (existing.value.thread.projectId !== project.id) {
+          return yield* new AgentSessionThreadProjectConflictError({
+            threadId,
+            expectedProjectId: project.id,
+            actualProjectId: existing.value.thread.projectId,
+          });
+        }
+        if (existing.value.thread.historyOrigin !== "v1_import") {
+          return yield* new AgentSessionThreadModifiedError({ threadId });
+        }
+        // A transcript can change after the import, so record it only when the
+        // thread already holds exactly its messages.
+        const stored = existing.value.messages;
+        if (
+          stored.length !== thread.messages.length ||
+          stored.some(
+            (message, index) =>
+              message.role !== thread.messages[index]?.role ||
+              message.text !== thread.messages[index]?.text,
+          )
+        ) {
+          return "skipped" as const;
+        }
+        yield* persistRuntime;
+        yield* runtimes.recordImportedTranscript({ threadId, source });
+        return "existing" as const;
+      }
+
+      const model = thread.model ?? DEFAULT_MODEL_BY_PROVIDER[driver] ?? DEFAULT_MODEL;
+      const providerThreadId = idAllocator.derive.providerThread({
+        driver,
+        providerInstanceId: thread.providerInstanceId,
+        nativeThreadId,
+      });
+      const createdAt = dateTime(thread.createdAt);
+      const updatedAt = dateTime(thread.updatedAt);
+      const appThread: OrchestrationV2AppThread = {
+        createdBy: "system",
+        creationSource: "server",
+        id: threadId,
+        projectId: project.id,
+        title: thread.title.trim() === "" ? "Untitled thread" : thread.title,
+        providerInstanceId: thread.providerInstanceId,
+        modelSelection: { instanceId: thread.providerInstanceId, model },
+        runtimeMode: input.runtimeMode,
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        branch: outcome.worktree?.branch ?? null,
+        worktreePath: outcome.worktree?.path ?? null,
+        linkedPullRequest: null,
+        branchPullRequest: null,
+        activeProviderThreadId: providerThreadId,
+        historyOrigin: "v1_import",
+        lineage: {
+          parentThreadId: null,
+          relationshipToParent: null,
+          rootThreadId: threadId,
+        },
+        forkedFrom: null,
+        createdAt,
+        updatedAt,
+        archivedAt: null,
+        settledOverride: "settled",
+        settledAt: updatedAt,
+        unsettledAt: null,
+        snoozedUntil: null,
+        snoozedAt: null,
+        pinnedAt: null,
+        pinOrderKey: null,
+        activeOrderKey: null,
+        lastVisitedAt: null,
+        deletedAt: null,
+      };
+      const providerThread: OrchestrationV2ProviderThread = {
+        id: providerThreadId,
+        driver,
+        providerInstanceId: thread.providerInstanceId,
+        providerSessionId: null,
+        appThreadId: threadId,
+        ownerNodeId: null,
+        nativeThreadRef: {
+          driver,
+          nativeId: nativeThreadId,
+          strength: "strong",
+        },
+        nativeConversationHeadRef: null,
+        status: "idle",
+        firstRunOrdinal: null,
+        lastRunOrdinal: null,
+        handoffIds: [],
+        forkedFrom: null,
+        pendingBackgroundTasks: [],
+        createdAt,
+        updatedAt,
+      };
+
+      const committed = yield* eventSink.write({
+        unlessNativeThreadOwned: providerThread,
+        events: [
+          {
+            id: EventId.make(`${IMPORT_EVENT_PREFIX}:thread:${threadId}:created`),
+            type: "thread.created",
+            threadId,
+            providerInstanceId: thread.providerInstanceId,
+            occurredAt: createdAt,
+            payload: appThread,
+          },
+          ...(thread.omittedMessageCount > 0
+            ? [
+                {
+                  id: EventId.make(`${IMPORT_EVENT_PREFIX}:history-truncated:${threadId}`),
+                  type: "turn-item.updated" as const,
+                  threadId,
+                  occurredAt: createdAt,
+                  payload: {
+                    id: TurnItemId.make(`${IMPORT_EVENT_PREFIX}:history-truncated:${threadId}`),
+                    threadId,
+                    runId: null,
+                    nodeId: null,
+                    providerThreadId: null,
+                    providerTurnId: null,
+                    nativeItemRef: null,
+                    parentItemId: null,
+                    ordinal: 0,
+                    status: "completed" as const,
+                    title: null,
+                    startedAt: createdAt,
+                    completedAt: createdAt,
+                    updatedAt: createdAt,
+                    type: "system_notice" as const,
+                    message: `${thread.omittedMessageCount} earlier ${thread.omittedMessageCount === 1 ? "message was" : "messages were"} not imported. This thread keeps the first user message and the most recent history. The original session transcript is unchanged.`,
+                  },
+                },
+              ]
+            : []),
+          ...thread.messages.flatMap((message, index) =>
+            messageEvents({ threadId, index, message }),
+          ),
+          {
+            id: EventId.make(`${IMPORT_EVENT_PREFIX}:provider-thread:${providerThreadId}`),
+            type: "provider-thread.updated",
+            threadId,
+            driver,
+            providerInstanceId: thread.providerInstanceId,
+            occurredAt: updatedAt,
+            payload: providerThread,
+          },
+        ],
+      });
+      if (committed.length === 0) return "owned" as const;
+      yield* persistRuntime;
+      yield* runtimes.recordImportedTranscript({ threadId, source });
+      return "imported" as const;
+    },
+    (effect, input) =>
+      effect.pipe(
+        Effect.catch((cause) =>
+          Effect.logWarning("Could not import an agent session", {
+            provider: input.outcome.thread.source,
+            sessionId: input.outcome.thread.providerSessionId,
+            cause,
+          }).pipe(Effect.as("skipped" as const)),
+        ),
+      ),
+  );
+
+  const importRecentAgentThreads = Effect.fn("importRecentAgentThreadsV2")(function* (
+    input: AgentSessionImportInput,
+  ) {
+    const project = yield* importProject(input.projectId);
     if (
       input.expectedWorkspaceRoot !== undefined &&
       normalizeProjectPathForComparison(project.workspaceRoot) !==
@@ -225,21 +499,7 @@ const make = Effect.gen(function* () {
     ) {
       return yield* new AgentSessionImportProjectChangedError({ projectId: input.projectId });
     }
-    // Imports run in full access, except under a policy ceiling: then in the project's default,
-    // which the policy keeps under it, so imported threads never sit above the ceiling.
-    const runtimeMode =
-      ceiling === undefined
-        ? DEFAULT_RUNTIME_MODE
-        : yield* settingsService.getSettings.pipe(
-            Effect.mapError(
-              (cause) => new AgentSessionScanError({ operation: "read-settings", cause }),
-            ),
-            Effect.map((settings) => {
-              const mode = resolveProjectSettings(settings, input.projectId, project).settings
-                .defaultRuntimeMode;
-              return isRuntimeModeAbove(mode, ceiling) ? ceiling : mode;
-            }),
-          );
+    const runtimeMode = yield* importRuntimeMode(project);
     const runtimeRows = yield* runtimes
       .list()
       .pipe(
@@ -274,9 +534,7 @@ const make = Effect.gen(function* () {
           return;
         }
         const source = outcome.source;
-        const threadId = ThreadId.make(
-          `import:${source.providerInstanceId}:${source.providerSessionId}`,
-        );
+        const threadId = importedThreadId(source);
         if (outcome._tag === "AlreadyImported") {
           importedThreadIds.add(threadId);
           return;
@@ -288,210 +546,10 @@ const make = Effect.gen(function* () {
           return;
         }
 
-        const imported = yield* Effect.gen(function* () {
-          const thread = outcome.thread;
-          if (
-            thread.source === "claudeAgent" &&
-            !CLAUDE_SESSION_ID_PATTERN.test(thread.providerSessionId)
-          ) {
-            return yield* new AgentSessionUnresumableSessionError({
-              source: thread.source,
-              providerSessionId: thread.providerSessionId,
-            });
-          }
-          const driver = ProviderDriverKind.make(thread.source);
-          // Pi resumes by session file path; its session UUID only names the thread.
-          const nativeThreadId =
-            thread.source === "pi" ? source.filePath : thread.providerSessionId;
-          const persistRuntime = runtimes.upsert(
-            {
-              threadId,
-              providerName: driver,
-              providerInstanceId: thread.providerInstanceId,
-              adapterKey: driver,
-              runtimeMode,
-              status: "stopped",
-              lastSeenAt: thread.updatedAt,
-              resumeCursor:
-                thread.source === "claudeAgent"
-                  ? { threadId, resume: thread.providerSessionId }
-                  : { threadId: nativeThreadId },
-              runtimePayload: { cwd: outcome.worktree?.path ?? project.workspaceRoot },
-            },
-            { onConflict: "ignore" },
-          );
-          const existing = yield* Effect.option(
-            orchestrator.getThreadRecords(threadId, ["messages"]),
-          );
-          if (Option.isSome(existing)) {
-            if (existing.value.thread.projectId !== input.projectId) {
-              return yield* new AgentSessionThreadProjectConflictError({
-                threadId,
-                expectedProjectId: input.projectId,
-                actualProjectId: existing.value.thread.projectId,
-              });
-            }
-            if (existing.value.thread.historyOrigin !== "v1_import") {
-              return yield* new AgentSessionThreadModifiedError({ threadId });
-            }
-            // A transcript can change after the import, so record it only when the
-            // thread already holds exactly its messages.
-            const stored = existing.value.messages;
-            if (
-              stored.length !== thread.messages.length ||
-              stored.some(
-                (message, index) =>
-                  message.role !== thread.messages[index]?.role ||
-                  message.text !== thread.messages[index]?.text,
-              )
-            ) {
-              return false;
-            }
-            yield* persistRuntime;
-            yield* runtimes.recordImportedTranscript({ threadId, source });
-            importedThreadIds.add(threadId);
-            return null;
-          }
-
-          const model = thread.model ?? DEFAULT_MODEL_BY_PROVIDER[driver] ?? DEFAULT_MODEL;
-          const providerThreadId = idAllocator.derive.providerThread({
-            driver,
-            providerInstanceId: thread.providerInstanceId,
-            nativeThreadId,
-          });
-          const createdAt = dateTime(thread.createdAt);
-          const updatedAt = dateTime(thread.updatedAt);
-          const appThread: OrchestrationV2AppThread = {
-            createdBy: "system",
-            creationSource: "server",
-            id: threadId,
-            projectId: input.projectId,
-            title: thread.title.trim() === "" ? "Untitled thread" : thread.title,
-            providerInstanceId: thread.providerInstanceId,
-            modelSelection: { instanceId: thread.providerInstanceId, model },
-            runtimeMode,
-            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-            branch: outcome.worktree?.branch ?? null,
-            worktreePath: outcome.worktree?.path ?? null,
-            linkedPullRequest: null,
-            branchPullRequest: null,
-            activeProviderThreadId: providerThreadId,
-            historyOrigin: "v1_import",
-            lineage: {
-              parentThreadId: null,
-              relationshipToParent: null,
-              rootThreadId: threadId,
-            },
-            forkedFrom: null,
-            createdAt,
-            updatedAt,
-            archivedAt: null,
-            settledOverride: "settled",
-            settledAt: updatedAt,
-            unsettledAt: null,
-            snoozedUntil: null,
-            snoozedAt: null,
-            pinnedAt: null,
-            pinOrderKey: null,
-            activeOrderKey: null,
-            lastVisitedAt: null,
-            deletedAt: null,
-          };
-          const providerThread: OrchestrationV2ProviderThread = {
-            id: providerThreadId,
-            driver,
-            providerInstanceId: thread.providerInstanceId,
-            providerSessionId: null,
-            appThreadId: threadId,
-            ownerNodeId: null,
-            nativeThreadRef: {
-              driver,
-              nativeId: nativeThreadId,
-              strength: "strong",
-            },
-            nativeConversationHeadRef: null,
-            status: "idle",
-            firstRunOrdinal: null,
-            lastRunOrdinal: null,
-            handoffIds: [],
-            forkedFrom: null,
-            pendingBackgroundTasks: [],
-            createdAt,
-            updatedAt,
-          };
-
-          const committed = yield* eventSink.write({
-            unlessNativeThreadOwned: providerThread,
-            events: [
-              {
-                id: EventId.make(`${IMPORT_EVENT_PREFIX}:thread:${threadId}:created`),
-                type: "thread.created",
-                threadId,
-                providerInstanceId: thread.providerInstanceId,
-                occurredAt: createdAt,
-                payload: appThread,
-              },
-              ...(thread.omittedMessageCount > 0
-                ? [
-                    {
-                      id: EventId.make(`${IMPORT_EVENT_PREFIX}:history-truncated:${threadId}`),
-                      type: "turn-item.updated" as const,
-                      threadId,
-                      occurredAt: createdAt,
-                      payload: {
-                        id: TurnItemId.make(`${IMPORT_EVENT_PREFIX}:history-truncated:${threadId}`),
-                        threadId,
-                        runId: null,
-                        nodeId: null,
-                        providerThreadId: null,
-                        providerTurnId: null,
-                        nativeItemRef: null,
-                        parentItemId: null,
-                        ordinal: 0,
-                        status: "completed" as const,
-                        title: null,
-                        startedAt: createdAt,
-                        completedAt: createdAt,
-                        updatedAt: createdAt,
-                        type: "system_notice" as const,
-                        message: `${thread.omittedMessageCount} earlier ${thread.omittedMessageCount === 1 ? "message was" : "messages were"} not imported. This thread keeps the first user message and the most recent history. The original session transcript is unchanged.`,
-                      },
-                    },
-                  ]
-                : []),
-              ...thread.messages.flatMap((message, index) =>
-                messageEvents({ threadId, index, message }),
-              ),
-              {
-                id: EventId.make(`${IMPORT_EVENT_PREFIX}:provider-thread:${providerThreadId}`),
-                type: "provider-thread.updated",
-                threadId,
-                driver,
-                providerInstanceId: thread.providerInstanceId,
-                occurredAt: updatedAt,
-                payload: providerThread,
-              },
-            ],
-          });
-          if (committed.length === 0) return null;
-          yield* persistRuntime;
-          yield* runtimes.recordImportedTranscript({ threadId, source });
-          return true;
-        }).pipe(
-          Effect.catch((cause) =>
-            Effect.logWarning("Could not import an agent session", {
-              provider: outcome.thread.source,
-              sessionId: outcome.thread.providerSessionId,
-              cause,
-            }).pipe(Effect.as(false)),
-          ),
-        );
-        if (imported === true) {
-          importedThreadIds.add(threadId);
-          importedCount += 1;
-        } else if (imported === false) {
-          skippedCount += 1;
-        }
+        const imported = yield* importThread({ project, runtimeMode, outcome });
+        if (imported === "imported" || imported === "existing") importedThreadIds.add(threadId);
+        if (imported === "imported") importedCount += 1;
+        else if (imported === "skipped") skippedCount += 1;
       }),
     );
 
@@ -596,7 +654,68 @@ const make = Effect.gen(function* () {
     return yield* commit(messages);
   });
 
-  return { importRecentAgentThreads, importNativeHistory };
+  const listSessions = Effect.fn("AgentSessionImporter.listSessions")(function* (
+    input: AgentSessionListInput,
+  ) {
+    const project = yield* importProject(input.projectId);
+    const { sessions, truncated } = yield* scanner.sessions(project.workspaceRoot);
+    const owners = yield* claudeSessionOwners();
+    return {
+      sessions: sessions.flatMap((session) => {
+        const owner = owners.get(`${session.providerInstanceId}\0${session.providerSessionId}`);
+        // A session T3 Code started, or one whose thread was deleted, is not a terminal session to pick up.
+        if (
+          owner !== undefined &&
+          (owner.deleted || owner.threadId !== importedThreadId(session))
+        ) {
+          return [];
+        }
+        return [
+          {
+            provider: session.source,
+            providerInstanceId: session.providerInstanceId,
+            providerSessionId: session.providerSessionId,
+            title: session.title,
+            lastPrompt: session.lastPrompt,
+            lastActiveAt: session.lastActiveAt,
+            branch: session.worktree?.branch ?? null,
+            threadId: owner?.threadId ?? null,
+          },
+        ];
+      }),
+      truncated,
+    } satisfies AgentSessionListResult;
+  });
+
+  const importSession = Effect.fn("AgentSessionImporter.importSession")(function* (
+    input: AgentSessionImportSessionInput,
+  ) {
+    const project = yield* importProject(input.projectId);
+    const runtimeMode = yield* importRuntimeMode(project);
+    const threadId = importedThreadId(input);
+    const outcomes = yield* Stream.runCollect(
+      scanner.recentThreads(project.workspaceRoot, [], input),
+    );
+    for (const outcome of outcomes) {
+      if (outcome._tag !== "Importable") continue;
+      const imported = yield* importThread({ project, runtimeMode, outcome });
+      if (imported === "imported" || imported === "existing") {
+        return { threadId } satisfies AgentSessionImportSessionResult;
+      }
+    }
+    // The transcript may have grown since an earlier import; that thread still continues it.
+    const owner = (yield* claudeSessionOwners()).get(
+      `${input.providerInstanceId}\0${input.providerSessionId}`,
+    );
+    if (owner === undefined || owner.deleted || owner.threadId !== threadId) {
+      return yield* new AgentSessionImportSessionUnavailableError({
+        providerSessionId: input.providerSessionId,
+      });
+    }
+    return { threadId } satisfies AgentSessionImportSessionResult;
+  });
+
+  return { importRecentAgentThreads, importNativeHistory, listSessions, importSession };
 });
 
 type AgentSessionImporterShape = Effect.Success<typeof make>;

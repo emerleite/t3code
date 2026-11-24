@@ -45,6 +45,7 @@ import {
 } from "../ui/combobox";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { InlineButton } from "../ui/button";
+import { ContinueSessionButton } from "./ContinueSessionPicker";
 import { DraftProjectName } from "./DraftProjectName";
 import { DraftHeroProjectHeading } from "./DraftHeroProjectHeading";
 import { TriageDraftHero } from "./TriageDraftHero";
@@ -345,6 +346,11 @@ export function DraftHeroHeadline({
       </Tooltip>
     ) : null;
 
+  const continueSession =
+    activeProjectRef !== null && hasResolvedProject && !isScratchDraft ? (
+      <ContinueSessionButton projectRef={activeProjectRef} />
+    ) : null;
+
   if (isScratchDraft && isTriageDraftPrompt) {
     const environment = environments.find(
       (entry) => entry.environmentId === activeProject.environmentId,
@@ -376,9 +382,14 @@ export function DraftHeroHeadline({
           )}
         </h1>
       )}
-      {scratchWorkspaceRoot === null ? null : (
-        <p className="mt-2 flex h-6 w-full items-center justify-center text-sm">
-          {isScratchDraft ? projectSelector : orStartWithoutProject}
+      {scratchWorkspaceRoot === null && continueSession === null ? null : (
+        <p className="mt-2 flex min-h-6 w-full flex-wrap items-center justify-center gap-x-3 text-sm">
+          {scratchWorkspaceRoot === null
+            ? null
+            : isScratchDraft
+              ? projectSelector
+              : orStartWithoutProject}
+          {continueSession}
         </p>
       )}
     </div>

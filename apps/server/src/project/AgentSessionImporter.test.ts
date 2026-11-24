@@ -239,7 +239,36 @@ const makeImporter = Effect.fn(function* (
           ),
           realScan === undefined
             ? Layer.mock(AgentSessionScanner.AgentSessionScanner)({
-                recentThreads: () => Stream.fromIterable(candidates),
+                recentThreads: (_workspaceRoot, _completed, only) =>
+                  Stream.fromIterable(
+                    only === undefined
+                      ? candidates
+                      : candidates.filter(
+                          (entry) =>
+                            entry._tag === "Importable" &&
+                            entry.source.providerInstanceId === only.providerInstanceId &&
+                            entry.source.providerSessionId === only.providerSessionId,
+                        ),
+                  ),
+                sessions: () =>
+                  Effect.succeed({
+                    sessions: candidates.flatMap((entry) =>
+                      entry._tag === "Importable"
+                        ? [
+                            {
+                              source: entry.source.provider,
+                              providerInstanceId: entry.source.providerInstanceId,
+                              providerSessionId: entry.source.providerSessionId,
+                              title: entry.thread.title,
+                              lastPrompt: null,
+                              lastActiveAt: entry.thread.updatedAt,
+                              worktree: entry.worktree,
+                            },
+                          ]
+                        : [],
+                    ),
+                    truncated: false,
+                  }),
               })
             : Layer.succeed(AgentSessionScanner.AgentSessionScanner, realScan.scanner),
           Layer.mock(ProjectService.ProjectService)({
@@ -280,6 +309,8 @@ const makeImporter = Effect.fn(function* (
   return {
     run: importer.importRecentAgentThreads({ projectId }),
     importNativeHistory: importer.importNativeHistory,
+    listSessions: importer.listSessions({ projectId }),
+    importSession: importer.importSession,
     published,
   };
 });
@@ -385,6 +416,81 @@ it.effect(
         });
       }
     }).pipe(Effect.scoped, Effect.provide(persistence)),
+);
+
+it.effect("lists terminal Claude sessions and imports the one picked", () =>
+  Effect.gen(function* () {
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const picked = candidate(
+      CLAUDE_MODEL_SELECTION,
+      "11111111-1111-4111-8111-111111111111",
+      "claudeAgent",
+    );
+    picked.worktree = { path: "/workspace/project/.claude/worktrees/feat", branch: "feat" };
+    const startedHere = candidate(
+      CLAUDE_MODEL_SELECTION,
+      "22222222-2222-4222-8222-222222222222",
+      "claudeAgent",
+    );
+    const deleted = candidate(
+      CLAUDE_MODEL_SELECTION,
+      "33333333-3333-4333-8333-333333333333",
+      "claudeAgent",
+    );
+    yield* seedOwner(startedHere);
+    yield* seedOwner(deleted, "deleted");
+    const importer = yield* makeImporter([picked, startedHere, deleted]);
+    const select = ({ source }: ReturnType<typeof candidate>) => ({
+      projectId,
+      providerInstanceId: source.providerInstanceId,
+      providerSessionId: source.providerSessionId,
+    });
+    const listed = (threadId: ThreadId | null) => ({
+      sessions: [
+        {
+          provider: "claudeAgent",
+          providerInstanceId: picked.source.providerInstanceId,
+          providerSessionId: picked.source.providerSessionId,
+          title: "Imported thread",
+          lastPrompt: null,
+          lastActiveAt: timestamp,
+          branch: "feat",
+          threadId,
+        },
+      ],
+      truncated: false,
+    });
+
+    expect(yield* importer.listSessions).toEqual(listed(null));
+    expect(yield* importer.importSession(select(picked))).toEqual({ threadId: importId(picked) });
+    const records = yield* projections.getThreadRecords(importId(picked), [
+      "messages",
+      "providerThreads",
+    ]);
+    expect(records.messages.map((message) => message.text)).toEqual(["Fix it", "Fixed"]);
+    expect(records.thread.worktreePath).toBe(picked.worktree.path);
+    expect(records.providerThreads[0]?.nativeThreadRef?.nativeId).toBe(
+      picked.source.providerSessionId,
+    );
+    // Picking it again opens the thread the first import created.
+    expect(yield* importer.listSessions).toEqual(listed(importId(picked)));
+    expect(yield* importer.importSession(select(picked))).toEqual({ threadId: importId(picked) });
+
+    for (const source of [startedHere, deleted]) {
+      expect(yield* Effect.flip(importer.importSession(select(source)))).toMatchObject({
+        _tag: "AgentSessionImportSessionUnavailableError",
+        providerSessionId: source.source.providerSessionId,
+      });
+    }
+    expect(
+      yield* Effect.flip(
+        importer.importSession({
+          ...select(picked),
+          providerSessionId: "44444444-4444-4444-8444-444444444444",
+        }),
+      ),
+    ).toMatchObject({ _tag: "AgentSessionImportSessionUnavailableError" });
+  }).pipe(Effect.scoped, Effect.provide(persistence)),
 );
 
 it.effect("tolerates a missing transcript owner but propagates failed ownership reads", () =>

@@ -12798,5 +12798,37 @@
     ")"
   ],
   "33d18dda74f6d7b3": "Cancelar merge automático da pilha",
-  "012c67c7f1a99e33": "Merge automático da pilha"
+  "012c67c7f1a99e33": "Merge automático da pilha",
+  "9b6bef3746b8b006": "Não foi possível continuar a sessão",
+  "c8b78e7d8682b81e": "Escolha uma sessão",
+  "399a0a74a792ce8c": "Buscar sessões...",
+  "7635bef1a86f132a": "Sessão sem título",
+  "44ac1782f7e61c45": [
+    "ou continuar uma sessão do ",
+    {
+      "i": 1,
+      "k": "_gt_value_1",
+      "v": "v"
+    }
+  ],
+  "98bafe711bc5fc17": [
+    "Continuar uma sessão do ",
+    {
+      "i": 1,
+      "k": "_gt_value_1",
+      "v": "v"
+    }
+  ],
+  "79c314fc54f8b66f": "Procurando sessões...",
+  "b95bf7e5ba01c1e1": [
+    "Nenhuma sessão do ",
+    {
+      "i": 1,
+      "k": "_gt_value_1",
+      "v": "v"
+    },
+    " encontrada para este projeto."
+  ],
+  "78a87dc17c06455f": "Aberta",
+  "be436213a44a2a56": "Mostrando as sessões mais recentes."
 }

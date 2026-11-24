@@ -86,6 +86,12 @@ const RECENT_THREAD_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 // Screenshot-heavy transcripts can reach GiB; select fields while streaming to avoid allocating payloads.
 const MAX_IMPORTED_TRANSCRIPT_BYTES = 4 * 1024 * 1024 * 1024;
 const MAX_IMPORTED_MESSAGES = 200;
+// One session picked by hand shows more of its history than a batch import does.
+const MAX_SINGLE_IMPORT_MESSAGES = 2000;
+const MAX_LISTED_SESSIONS = 100;
+const SESSION_TAIL_BYTES = 64 * 1024;
+const SESSION_TAIL_READ_CONCURRENCY = 8;
+const MAX_LAST_PROMPT_CHARACTERS = 200;
 const MAX_IMPORT_HISTORY_BYTES = 32 * 1024 * 1024;
 const MAX_IMPORT_BYTES = 4 * 1024 * 1024 * 1024;
 const MAX_IMPORT_TRANSCRIPTS = 100;
@@ -181,6 +187,16 @@ const selectCwdPath = createTranscriptJsonSelector(
   }),
 );
 const decodeCodexTurnMetadata = Schema.decodeUnknownOption(CodexTurnMetadata);
+// Claude Code rewrites these small records at the end of a transcript as the session goes on.
+const decodeClaudeSessionTailRecord = Schema.decodeUnknownOption(
+  Schema.fromJsonString(
+    Schema.Struct({
+      aiTitle: Schema.optional(Schema.String),
+      customTitle: Schema.optional(Schema.String),
+      lastPrompt: Schema.optional(Schema.String),
+    }),
+  ),
+);
 export const decodeImportedTranscriptPayload = Schema.decodeUnknownOption(
   Schema.Struct({
     cwd: Schema.optional(Schema.String),
@@ -210,6 +226,7 @@ interface AgentSessionTranscriptMetadata {
   readonly providerInstanceId: ProviderInstanceId;
   readonly fallbackSessionId: string;
   readonly lastActiveAtMs: number;
+  readonly maxMessages?: number;
 }
 
 export interface AgentSessionThreadMessage {
@@ -242,6 +259,21 @@ export type AgentSessionRecentThread =
   | { readonly _tag: "Duplicate"; readonly source: AgentSessionImportSource }
   | { readonly _tag: "Skipped" };
 
+export interface AgentSessionListing {
+  readonly source: AgentSessionImportSource["provider"];
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly providerSessionId: string;
+  readonly title: string | null;
+  readonly lastPrompt: string | null;
+  readonly lastActiveAt: string;
+  readonly worktree: { readonly path: string; readonly branch: string | null } | null;
+}
+
+export interface AgentSessionSelector {
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly providerSessionId: string;
+}
+
 export class AgentSessionScanner extends Context.Service<
   AgentSessionScanner,
   {
@@ -249,7 +281,17 @@ export class AgentSessionScanner extends Context.Service<
     readonly recentThreads: (
       workspaceRoot: string,
       completedSources?: ReadonlyArray<AgentSessionImportSource>,
+      /** Reads only this session, whatever its age, and keeps more of its history. */
+      only?: AgentSessionSelector,
     ) => Stream.Stream<AgentSessionRecentThread, AgentSessionScanError>;
+    /** The project's Claude Code sessions, newest first. */
+    readonly sessions: (workspaceRoot: string) => Effect.Effect<
+      {
+        readonly sessions: ReadonlyArray<AgentSessionListing>;
+        readonly truncated: boolean;
+      },
+      AgentSessionScanError
+    >;
   }
 >()("t3/project/AgentSessionScanner") {}
 
@@ -527,6 +569,7 @@ function parseAgentSessionRecords(
   droppedMessageCount: number,
 ): AgentSessionThread | "empty" | null {
   const fallbackTimestamp = DateTime.formatIso(DateTime.makeUnsafe(input.lastActiveAtMs));
+  const maxMessages = input.maxMessages ?? MAX_IMPORTED_MESSAGES;
   // Claude filenames are session IDs. Codex rollout filenames include extra
   // timestamp text, so only transcript metadata can provide a resumable ID.
   let providerSessionId =
@@ -620,7 +663,7 @@ function parseAgentSessionRecords(
     hasAssistantMessage ||= message.role === "assistant";
     conversationMessageCount += 1;
     messages.push(message);
-    if (messages.length > MAX_IMPORTED_MESSAGES) messages.shift();
+    if (messages.length > maxMessages) messages.shift();
   };
 
   const hasMatchingCodexEventInTurn = (text: string) => {
@@ -755,7 +798,7 @@ function parseAgentSessionRecords(
   const { codexResponseUser: _codexResponseUser, ...visibleFirstUserMessage } = firstUserMessage;
   const retainedMessages = firstUserMessageRetained
     ? visibleMessages
-    : [visibleFirstUserMessage, ...visibleMessages.slice(-(MAX_IMPORTED_MESSAGES - 1))];
+    : [visibleFirstUserMessage, ...visibleMessages.slice(-(maxMessages - 1))];
 
   return {
     source: input.source,
@@ -802,7 +845,7 @@ function shouldRetainDecodedRecord(
 
 // The import shows only the first user message and the latest messages, so a
 // long Claude session holds just those and counts the rest as dropped.
-function createClaudeHistoryWindow() {
+function createClaudeHistoryWindow(maxMessages: number) {
   const recent: Array<{ readonly record: DecodedTranscriptRecord; readonly bytes: number }> = [];
   let firstUser: DecodedTranscriptRecord | undefined;
   let droppedMessageCount = 0;
@@ -811,7 +854,7 @@ function createClaudeHistoryWindow() {
     push: (record: DecodedTranscriptRecord, bytes: number): number => {
       if (firstUser === undefined && record.type === "user") firstUser = record;
       recent.push({ record, bytes });
-      if (recent.length <= MAX_IMPORTED_MESSAGES) return 0;
+      if (recent.length <= maxMessages) return 0;
       const evicted = recent.shift();
       if (evicted === undefined || evicted.record === firstUser) return 0;
       droppedMessageCount += 1;
@@ -1345,6 +1388,7 @@ export const make = Effect.gen(function* () {
     expected: ReturnType<typeof transcriptIdentity>,
     source: AgentSessionSource,
     prefix?: { readonly endByteOffset: number; readonly historyBytes: number },
+    maxMessages = MAX_IMPORTED_MESSAGES,
   ) {
     const compressed = isCompressedTranscript(filePath);
     const readBytes =
@@ -1362,7 +1406,7 @@ export const make = Effect.gen(function* () {
             }
             const readChunk = yield* transcriptChunkReader(file, filePath);
             const records: Array<DecodedTranscriptRecord> = [];
-            const claudeHistory = createClaudeHistoryWindow();
+            const claudeHistory = createClaudeHistoryWindow(maxMessages);
             let cwd = Option.none<string>();
             let claudeFields = emptyClaudeFields;
             let historyBytes = prefix?.historyBytes ?? 0;
@@ -2107,24 +2151,23 @@ export const make = Effect.gen(function* () {
     };
   });
 
-  const prepareRecentThreads = Effect.fn("AgentSessionScanner.prepareRecentThreads")(function* (
+  const rootTranscripts = Effect.fn("AgentSessionScanner.rootTranscripts")(function* (
     workspaceRoot: string,
-    completedSources: ReadonlyArray<AgentSessionImportSource>,
+    refresh: boolean,
   ) {
     const root = path.resolve(expandHomePath(workspaceRoot, homeDir));
     const realRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
     if (isExcludedProjectPath(root) || isExcludedProjectPath(realRoot, realT3Dirs)) {
-      return Stream.empty;
+      return null;
     }
     const rootIdentity = yield* directoryIdentity(root);
     const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
-    const cutoffMs = nowMs - RECENT_THREAD_WINDOW_MS;
 
     // Imports recorded since a budget-truncated collection can free budget for transcripts it cut off.
-    if (cachedCandidates === null || cachedCandidates.metadataTruncated) {
+    if (refresh || cachedCandidates === null || cachedCandidates.metadataTruncated) {
       cachedCandidates = yield* collectCandidates();
     }
-    const { candidates } = cachedCandidates;
+    const { candidates, truncated } = cachedCandidates;
 
     // The scan counts a linked worktree's sessions toward its main checkout, so import them with it.
     const candidateDirectories = candidates.flatMap((candidate) => {
@@ -2165,8 +2208,9 @@ export const make = Effect.gen(function* () {
       return worktree;
     });
 
-    const eligibleTranscripts: Array<{
+    const transcripts: Array<{
       readonly candidate: RawCandidate;
+      readonly cwd: string;
       readonly transcript: RawCandidate["transcripts"][number] & { readonly mtimeMs: number };
     }> = [];
     for (const candidate of candidates) {
@@ -2176,26 +2220,111 @@ export const make = Effect.gen(function* () {
       if (!(yield* belongsToRoot(resolved))) continue;
 
       for (const transcript of candidate.transcripts) {
-        if (
-          transcript.mtimeMs === null ||
-          transcript.mtimeMs < cutoffMs ||
-          transcript.mtimeMs > nowMs
-        ) {
-          continue;
-        }
-        eligibleTranscripts.push({
+        if (transcript.mtimeMs === null || transcript.mtimeMs > nowMs) continue;
+        transcripts.push({
           candidate,
+          cwd: resolved,
           transcript: { ...transcript, mtimeMs: transcript.mtimeMs },
         });
       }
     }
 
-    eligibleTranscripts.sort((left, right) => {
+    transcripts.sort((left, right) => {
       if (left.transcript.mtimeMs !== right.transcript.mtimeMs) {
         return right.transcript.mtimeMs - left.transcript.mtimeMs;
       }
       return left.transcript.filePath.localeCompare(right.transcript.filePath);
     });
+
+    return { candidates, truncated, nowMs, belongsToRoot, rootWorktree, transcripts };
+  });
+
+  const readClaudeSessionTail = Effect.fn("AgentSessionScanner.readClaudeSessionTail")(function* (
+    filePath: string,
+  ) {
+    const lines = yield* Effect.scoped(
+      Effect.gen(function* () {
+        const file = yield* fileSystem.open(filePath, { flag: "r" });
+        const size = Number((yield* file.stat).size);
+        const start = Math.max(0, size - SESSION_TAIL_BYTES);
+        yield* file.seek(BigInt(start), "start");
+        const bytes = yield* file.readAlloc(size - start);
+        const tail = (Option.isSome(bytes) ? new TextDecoder().decode(bytes.value) : "").split(
+          "\n",
+        );
+        // A tail that starts past the first byte starts mid-record.
+        if (start > 0) tail.shift();
+        return tail;
+      }),
+    ).pipe(Effect.orElseSucceed((): Array<string> => []));
+    let title: string | undefined;
+    let customTitle: string | null = null;
+    let lastPrompt: string | null = null;
+    for (const line of lines) {
+      const record = decodeClaudeSessionTailRecord(line);
+      if (Option.isNone(record)) continue;
+      title = claudeTitle(record.value.aiTitle) ?? title;
+      if (record.value.customTitle !== undefined) {
+        customTitle = claudeTitle(record.value.customTitle) ?? null;
+      }
+      const prompt = record.value.lastPrompt?.replace(/\s+/g, " ").trim();
+      if (prompt) lastPrompt = Array.from(prompt).slice(0, MAX_LAST_PROMPT_CHARACTERS).join("");
+    }
+    return { title: customTitle ?? title ?? null, lastPrompt };
+  });
+
+  const sessions: AgentSessionScanner["Service"]["sessions"] = Effect.fn(
+    "AgentSessionScanner.sessions",
+  )(function* (workspaceRoot) {
+    const scoped = yield* rootTranscripts(workspaceRoot, true);
+    if (scoped === null) return { sessions: [], truncated: false };
+    // Only Claude names a transcript after the session it resumes by.
+    const claude = scoped.transcripts.filter(({ candidate }) => candidate.source === "claudeAgent");
+    const listed = claude.slice(0, MAX_LISTED_SESSIONS);
+    const worktrees = yield* Effect.forEach(listed, ({ cwd }) => scoped.rootWorktree(cwd));
+    const tails = yield* Effect.forEach(
+      listed,
+      ({ transcript }) => readClaudeSessionTail(transcript.filePath),
+      { concurrency: SESSION_TAIL_READ_CONCURRENCY },
+    );
+    return {
+      sessions: listed.map(({ candidate, transcript }, index): AgentSessionListing => ({
+        source: candidate.source,
+        providerInstanceId: candidate.providerInstanceId,
+        providerSessionId: path.basename(transcript.filePath, ".jsonl"),
+        title: tails[index]?.title ?? null,
+        lastPrompt: tails[index]?.lastPrompt ?? null,
+        lastActiveAt: DateTime.formatIso(DateTime.makeUnsafe(transcript.mtimeMs)),
+        worktree: worktrees[index] ?? null,
+      })),
+      truncated: scoped.truncated || claude.length > listed.length,
+    };
+  });
+
+  const prepareRecentThreads = Effect.fn("AgentSessionScanner.prepareRecentThreads")(function* (
+    workspaceRoot: string,
+    completedSources: ReadonlyArray<AgentSessionImportSource>,
+    only: AgentSessionSelector | undefined,
+  ) {
+    const select = (scoped: NonNullable<Effect.Success<ReturnType<typeof rootTranscripts>>>) =>
+      scoped.transcripts.filter(({ candidate, transcript }) =>
+        only === undefined
+          ? transcript.mtimeMs >= scoped.nowMs - RECENT_THREAD_WINDOW_MS
+          : candidate.source === "claudeAgent" &&
+            candidate.providerInstanceId === only.providerInstanceId &&
+            path.basename(transcript.filePath, ".jsonl") === only.providerSessionId,
+      );
+    let scoped = yield* rootTranscripts(workspaceRoot, false);
+    if (scoped === null) return Stream.empty;
+    let eligibleTranscripts = select(scoped);
+    // A session started after the last collection is not among the cached transcripts.
+    if (only !== undefined && eligibleTranscripts.length === 0) {
+      scoped = yield* rootTranscripts(workspaceRoot, true);
+      if (scoped === null) return Stream.empty;
+      eligibleTranscripts = select(scoped);
+    }
+    const { candidates, belongsToRoot, rootWorktree } = scoped;
+    const maxMessages = only === undefined ? MAX_IMPORTED_MESSAGES : MAX_SINGLE_IMPORT_MESSAGES;
 
     const completedByFile = Map.groupBy(
       completedSources,
@@ -2292,7 +2421,13 @@ export const make = Effect.gen(function* () {
           }
           transcriptsRemaining -= 1;
           bytesRemaining -= identity.size;
-          const snapshot = yield* readTranscript(transcript.filePath, identity, candidate.source);
+          const snapshot = yield* readTranscript(
+            transcript.filePath,
+            identity,
+            candidate.source,
+            undefined,
+            maxMessages,
+          );
           if (snapshot === null) {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
           }
@@ -2328,6 +2463,7 @@ export const make = Effect.gen(function* () {
                   : ".jsonl",
               ),
               lastActiveAtMs: transcript.mtimeMs,
+              maxMessages,
             },
             inheritedRecords === null
               ? snapshot.records
@@ -2384,9 +2520,10 @@ export const make = Effect.gen(function* () {
   const recentThreads: AgentSessionScanner["Service"]["recentThreads"] = (
     workspaceRoot,
     completedSources = [],
-  ) => Stream.unwrap(prepareRecentThreads(workspaceRoot, completedSources));
+    only,
+  ) => Stream.unwrap(prepareRecentThreads(workspaceRoot, completedSources, only));
 
-  return AgentSessionScanner.of({ scan, recentThreads });
+  return AgentSessionScanner.of({ scan, recentThreads, sessions });
 });
 
 export const layer = Layer.effect(AgentSessionScanner, make).pipe(

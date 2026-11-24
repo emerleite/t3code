@@ -1,5 +1,11 @@
 import * as Schema from "effect/Schema";
-import { IsoDateTime, NonNegativeInt, ProjectId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import {
+  IsoDateTime,
+  NonNegativeInt,
+  ProjectId,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
 export const AgentSessionSource = Schema.Literals(["claudeAgent", "codex", "pi"]);
@@ -77,6 +83,47 @@ export const AgentSessionImportResult = Schema.Struct({
   skippedCount: NonNegativeInt,
 });
 export type AgentSessionImportResult = typeof AgentSessionImportResult.Type;
+
+export const AgentSessionListInput = Schema.Struct({ projectId: ProjectId });
+export type AgentSessionListInput = typeof AgentSessionListInput.Type;
+
+export const AgentSessionSummary = Schema.Struct({
+  provider: AgentSessionSource,
+  providerInstanceId: ProviderInstanceId,
+  providerSessionId: TrimmedNonEmptyString,
+  title: Schema.NullOr(TrimmedNonEmptyString),
+  lastPrompt: Schema.NullOr(TrimmedNonEmptyString),
+  lastActiveAt: IsoDateTime,
+  branch: Schema.NullOr(TrimmedNonEmptyString),
+  // The thread an earlier import of this session created.
+  threadId: Schema.NullOr(ThreadId),
+});
+export type AgentSessionSummary = typeof AgentSessionSummary.Type;
+
+export const AgentSessionListResult = Schema.Struct({
+  sessions: Schema.Array(AgentSessionSummary),
+  truncated: Schema.Boolean,
+});
+export type AgentSessionListResult = typeof AgentSessionListResult.Type;
+
+export const AgentSessionImportSessionInput = Schema.Struct({
+  projectId: ProjectId,
+  providerInstanceId: ProviderInstanceId,
+  providerSessionId: TrimmedNonEmptyString,
+});
+export type AgentSessionImportSessionInput = typeof AgentSessionImportSessionInput.Type;
+
+export const AgentSessionImportSessionResult = Schema.Struct({ threadId: ThreadId });
+export type AgentSessionImportSessionResult = typeof AgentSessionImportSessionResult.Type;
+
+export class AgentSessionImportSessionUnavailableError extends Schema.TaggedError<AgentSessionImportSessionUnavailableError>()(
+  "AgentSessionImportSessionUnavailableError",
+  { providerSessionId: TrimmedNonEmptyString },
+) {
+  override get message(): string {
+    return `Session '${this.providerSessionId}' cannot be continued here. It may be empty, belong to another project, or already be open in another thread.`;
+  }
+}
 
 export class AgentSessionScanError extends Schema.TaggedError<AgentSessionScanError>()(
   "AgentSessionScanError",

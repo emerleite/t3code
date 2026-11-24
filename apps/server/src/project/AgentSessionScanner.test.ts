@@ -3015,6 +3015,158 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
       }),
     );
 
+    it.effect("lists a project's Claude sessions of any age with their titles", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+        yield* TestClock.setTime(nowMs);
+        const claudeHomePath = yield* makeTempDir("t3code-session-list-claude-");
+        const codexHomePath = yield* makeTempDir("t3code-session-list-codex-");
+        const workspace = yield* makeTempDir("t3code-session-list-workspace-");
+        const otherWorkspace = yield* makeTempDir("t3code-session-list-other-");
+        const transcript = (cwd: string, sessionId: string, tail: ReadonlyArray<unknown>) =>
+          [
+            { type: "user", cwd, sessionId, message: { role: "user", content: "Fix it" } },
+            { type: "assistant", sessionId, message: { role: "assistant", content: "Fixed" } },
+            ...tail,
+          ]
+            .map((record) => encodeTranscriptRecord(record))
+            .join("\n");
+        const dayMs = 24 * 60 * 60 * 1000;
+        yield* writeTranscript({
+          filePath: path.join(claudeHomePath, "projects", "-selected", "claude-recent.jsonl"),
+          contents: transcript(workspace, "claude-recent", [
+            { type: "ai-title", aiTitle: "Fix the importer" },
+            { type: "last-prompt", lastPrompt: "  Does it\nwork now?  " },
+          ]),
+          mtimeMs: nowMs - dayMs,
+        });
+        yield* writeTranscript({
+          filePath: path.join(claudeHomePath, "projects", "-selected", "claude-old.jsonl"),
+          contents: transcript(workspace, "claude-old", [
+            { type: "ai-title", aiTitle: "Generated title" },
+            { type: "custom-title", customTitle: "Renamed by hand" },
+          ]),
+          mtimeMs: nowMs - 60 * dayMs,
+        });
+        yield* writeTranscript({
+          filePath: path.join(claudeHomePath, "projects", "-selected", "claude-untitled.jsonl"),
+          contents: transcript(workspace, "claude-untitled", []),
+          mtimeMs: nowMs - 90 * dayMs,
+        });
+        yield* writeTranscript({
+          filePath: path.join(claudeHomePath, "projects", "-other", "claude-other.jsonl"),
+          contents: transcript(otherWorkspace, "claude-other", []),
+          mtimeMs: nowMs - dayMs,
+        });
+        yield* writeTranscript({
+          filePath: path.join(codexHomePath, "sessions", "2026", "08", "24", "rollout-codex.jsonl"),
+          contents: codexRolloutLine(workspace),
+          mtimeMs: nowMs - dayMs,
+        });
+
+        const listed = yield* Effect.gen(function* () {
+          const scanner = yield* AgentSessionScanner.AgentSessionScanner;
+          return yield* scanner.sessions(workspace);
+        }).pipe(Effect.provide(layerScannerTest({ claudeHomePath, codexHomePath })));
+
+        expect(listed.truncated).toBe(false);
+        expect(
+          listed.sessions.map(({ providerSessionId, title, lastPrompt, worktree }) => ({
+            providerSessionId,
+            title,
+            lastPrompt,
+            worktree,
+          })),
+        ).toEqual([
+          {
+            providerSessionId: "claude-recent",
+            title: "Fix the importer",
+            lastPrompt: "Does it work now?",
+            worktree: null,
+          },
+          {
+            providerSessionId: "claude-old",
+            title: "Renamed by hand",
+            lastPrompt: null,
+            worktree: null,
+          },
+          { providerSessionId: "claude-untitled", title: null, lastPrompt: null, worktree: null },
+        ]);
+        expect(listed.sessions[1]?.lastActiveAt).toBe("2026-06-25T12:00:00.000Z");
+      }),
+    );
+
+    it.effect("reads one picked Claude session past the recent window and the batch cap", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+        yield* TestClock.setTime(nowMs);
+        const claudeHomePath = yield* makeTempDir("t3code-session-pick-claude-");
+        const codexHomePath = yield* makeTempDir("t3code-session-pick-codex-");
+        const workspace = yield* makeTempDir("t3code-session-pick-workspace-");
+        const transcript = (sessionId: string, replies: number) =>
+          [
+            {
+              type: "user",
+              cwd: workspace,
+              sessionId,
+              message: { role: "user", content: "First prompt" },
+            },
+            ...Array.from({ length: replies }, (_, index) => {
+              const role = index % 2 === 0 ? "assistant" : "user";
+              return { type: role, sessionId, message: { role, content: `Message ${index}` } };
+            }),
+          ]
+            .map((record) => encodeTranscriptRecord(record))
+            .join("\n");
+        const dayMs = 24 * 60 * 60 * 1000;
+        yield* writeTranscript({
+          filePath: path.join(claudeHomePath, "projects", "-selected", "claude-picked.jsonl"),
+          contents: transcript("claude-picked", 300),
+          mtimeMs: nowMs - 60 * dayMs,
+        });
+        yield* writeTranscript({
+          filePath: path.join(claudeHomePath, "projects", "-selected", "claude-recent.jsonl"),
+          contents: transcript("claude-recent", 2),
+          mtimeMs: nowMs - dayMs,
+        });
+
+        const read = (providerSessionId: string | undefined) =>
+          Effect.gen(function* () {
+            const scanner = yield* AgentSessionScanner.AgentSessionScanner;
+            return yield* scanner
+              .recentThreads(
+                workspace,
+                [],
+                providerSessionId === undefined
+                  ? undefined
+                  : {
+                      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+                      providerSessionId,
+                    },
+              )
+              .pipe(
+                Stream.runCollect,
+                Effect.map((outcomes) =>
+                  Array.from(outcomes).flatMap((outcome) =>
+                    outcome._tag === "Importable" ? [outcome.thread] : [],
+                  ),
+                ),
+              );
+          }).pipe(Effect.provide(layerScannerTest({ claudeHomePath, codexHomePath })));
+
+        expect((yield* read(undefined)).map((thread) => thread.providerSessionId)).toEqual([
+          "claude-recent",
+        ]);
+        const picked = yield* read("claude-picked");
+        expect(picked.map((thread) => thread.providerSessionId)).toEqual(["claude-picked"]);
+        expect(picked[0]?.messages).toHaveLength(301);
+        expect(picked[0]?.omittedMessageCount).toBe(0);
+        expect(yield* read("claude-missing")).toEqual([]);
+      }),
+    );
+
     it.effect("imports a late first Claude prompt once when older replies are dropped", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;

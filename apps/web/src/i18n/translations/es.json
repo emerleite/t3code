@@ -12793,5 +12793,37 @@
     ")"
   ],
   "33d18dda74f6d7b3": "Cancelar la fusión automática de la pila",
-  "012c67c7f1a99e33": "Fusión automática de la pila"
+  "012c67c7f1a99e33": "Fusión automática de la pila",
+  "9b6bef3746b8b006": "No se pudo continuar la sesión",
+  "c8b78e7d8682b81e": "Elige una sesión",
+  "399a0a74a792ce8c": "Buscar sesiones...",
+  "7635bef1a86f132a": "Sesión sin título",
+  "44ac1782f7e61c45": [
+    "o continuar una sesión de ",
+    {
+      "i": 1,
+      "k": "_gt_value_1",
+      "v": "v"
+    }
+  ],
+  "98bafe711bc5fc17": [
+    "Continuar una sesión de ",
+    {
+      "i": 1,
+      "k": "_gt_value_1",
+      "v": "v"
+    }
+  ],
+  "79c314fc54f8b66f": "Buscando sesiones...",
+  "b95bf7e5ba01c1e1": [
+    "No se encontraron sesiones de ",
+    {
+      "i": 1,
+      "k": "_gt_value_1",
+      "v": "v"
+    },
+    " para este proyecto."
+  ],
+  "78a87dc17c06455f": "Abierta",
+  "be436213a44a2a56": "Se muestran las sesiones más recientes."
 }
